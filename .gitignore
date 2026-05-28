@@ -1,0 +1,28 @@
+# Database e dati generati automaticamente
+chromadb/
+logs/
+__pycache__/
+*.pyc
+*.pyo
+
+# File ML generati
+classifier.pt
+dataset_labels.jsonl
+conversations.jsonl
+
+# Documenti caricati (privati)
+documents/
+
+# Ambiente virtuale Python
+venv/
+env/
+.venv/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

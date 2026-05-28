@@ -1,0 +1,51 @@
+# backend/utils/normalizer.py
+from __future__ import annotations
+
+import re
+
+
+class QueryNormalizer:
+    """Normalizza le query per garantire match dei codici."""
+
+    CODE_PREFIXES = [
+        'ENV', 'CH', 'NPC', 'OBJ', 'ROOM', 'DIA', 'CS', 'EXAM',
+        'TALK', 'BKGNPC', 'COLLECT', 'READ', 'ZOOM', 'HINT',
+        'SKILL', 'ANIM'
+    ]
+
+    @classmethod
+    def normalize_code(cls, code: str) -> str:
+        code = code.upper().strip()
+        code = re.sub(r'[\s_\-]+', '', code)
+        match = re.match(r'([A-Z]+)(\d+)', code)
+        if match:
+            return match.group(1) + str(int(match.group(2)))
+        return code
+
+    @classmethod
+    def extract_codes(cls, text: str) -> list[str]:
+        text_upper = text.upper()
+        codes = set()
+
+        for prefix in cls.CODE_PREFIXES:
+            pattern = rf'\b{prefix}[\s_\-]*(\d+)'
+            matches = re.findall(pattern, text_upper)
+            for num in matches:
+                codes.add(f"{prefix}{num}")
+
+        return list(codes)
+
+    @classmethod
+    def is_code_query(cls, query: str) -> bool:
+        return len(cls.extract_codes(query)) > 0
+
+    @classmethod
+    def normalize_text_for_search(cls, text: str) -> str:
+        result = text.upper()
+        for prefix in cls.CODE_PREFIXES:
+            result = re.sub(
+                rf'\b({prefix})[\s_\-]+(\d+)',
+                r'\1\2',
+                result
+            )
+        return result

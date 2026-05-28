@@ -1,0 +1,29 @@
+import asyncio
+from backend.llm.query_analyzer import QueryAnalyzer, QueryIntent
+from backend.llm.search_planner import SearchPlanner
+from backend.llm.response_synthesizer import ResponseSynthesizer, SynthesisRequest
+
+
+def test_query_analyzer_basic():
+    qa = QueryAnalyzer()
+    analyzed = qa.analyze('Mostrami tutti gli ENV')
+    assert analyzed.intent == QueryIntent.LISTALL
+
+
+def test_search_planner_create_plan():
+    qa = QueryAnalyzer()
+    analyzed = qa.analyze('Mostrami tutti gli ENV')
+    sp = SearchPlanner()
+    plan = sp.create_plan(analyzed)
+    assert plan.steps
+
+
+def test_response_synthesizer_fallback():
+    qa = QueryAnalyzer()
+    analyzed = qa.analyze('Che cos\'è ENV109?')
+    # fake search result
+    fake_result = type('R', (), {'chunks': [{'text': 'ENV109: Test entry', 'source': 'doc1', 'matchtype': 'keyword'}], 'sources': ['doc1']})
+    rs = ResponseSynthesizer()
+    req = SynthesisRequest(query='Che cos\'è ENV109?', analyzedquery=analyzed, searchresult=fake_result)
+    resp = rs.synthesize(req)
+    assert 'ENV109' in resp.text or resp.text

@@ -1,0 +1,90 @@
+from __future__ import annotations
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import List, Optional, Iterator, Any
+import time
+
+
+class ResponseStyle(Enum):
+    CONCISE = auto()
+    DETAILED = auto()
+    LIST = auto()
+    TABLE = auto()
+    COMPARISON = auto()
+    NARRATIVE = auto()
+
+
+@dataclass
+class SynthesisRequest:
+    query: str
+    analyzedquery: Any
+    searchresult: Any
+    sessioncontext: dict = field(default_factory=dict)
+    preferredstyle: Optional[ResponseStyle] = None
+    maxlength: int = 2000
+    includesources: bool = True
+
+
+@dataclass
+class SynthesizedResponse:
+    text: str
+    styleused: ResponseStyle
+    sourcescited: List[str]
+    confidence: float
+    processingtimems: int
+    chunksused: int
+
+
+class ResponseSynthesizer:
+    SYSTEMPROMPTTEMPLATE = (
+        "Sei l'assistente AI interno di Smallthing Studios.\n"
+        "Usa solo informazioni dai documenti forniti.\n"
+    )
+
+    def __init__(self, llm_client: Any = None):
+        self.llm = llm_client
+
+    def determinestyle(self, analyzed: Any) -> ResponseStyle:
+        intent = analyzed.intent
+        name = getattr(intent, 'name', '')
+        if name in ('LISTALL', 'FIXLIST'):
+            return ResponseStyle.LIST
+        if name == 'COMPARE':
+            return ResponseStyle.COMPARISON
+        if name == 'EXPLAIN':
+            return ResponseStyle.NARRATIVE
+        if name == 'LOOKUPCODE':
+            return ResponseStyle.DETAILED
+        if analyzed.complexity.name == 'SIMPLE':
+            return ResponseStyle.CONCISE
+        return ResponseStyle.DETAILED
+
+    def build_prompt(self, request: SynthesisRequest) -> List[dict]:
+        style = request.preferredstyle or self.determinestyle(request.analyzedquery)
+        docs = []
+        for i, c in enumerate(request.searchresult.chunks):
+            matchinfo = 'MATCH' if c.get('matchtype') == 'keyword' else f"sim:{c.get('similarity', 'N/A')}"
+            docs.append(f"--- Doc {i+1} | {c.get('source','unknown')} | {matchinfo} ---\n{c.get('text','')}")
+        system = self.SYSTEMPROMPTTEMPLATE + '\n\n'.join(docs)
+        return [{"role": "system", "content": system}, {"role": "user", "content": request.query}]
+
+    def synthesize(self, request: SynthesisRequest) -> SynthesizedResponse:
+        start = time.time()
+        messages = self.build_prompt(request)
+        text = ''
+        success = True
+        if self.llm and hasattr(self.llm, 'chat'):
+            text, success = self.llm.chat(messages)
+        else:
+            # fallback: concatenate top chunks
+            text = '\n\n'.join(c.get('text','') for c in request.searchresult.chunks[:3]) or "Non ho trovato informazioni."
+
+        elapsed = int((time.time() - start) * 1000)
+        return SynthesizedResponse(text=text, styleused=request.preferredstyle or self.determinestyle(request.analyzedquery), sourcescited=request.searchresult.sources, confidence=getattr(request.analyzedquery, 'confidence', 0.0), processingtimems=elapsed, chunksused=len(request.searchresult.chunks))
+
+    def synthesizestreaming(self, request: SynthesisRequest) -> Iterator[str]:
+        if self.llm and hasattr(self.llm, 'streamchat'):
+            for chunk in self.llm.streamchat(self.build_prompt(request)):
+                yield chunk
+        else:
+            yield self.synthesize(request).text

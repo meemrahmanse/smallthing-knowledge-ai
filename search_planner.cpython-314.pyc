@@ -1,0 +1,218 @@
+from __future__ import annotations
+import re
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import List, Optional
+
+
+class QueryIntent(Enum):
+    LOOKUPCODE = auto()
+    LISTALL = auto()
+    SEARCHTOPIC = auto()
+    COMPARE = auto()
+    EXPLAIN = auto()
+    FIXLIST = auto()
+    LOCATIONQUERY = auto()
+    RELATIONSHIP = auto()
+    FOLLOWUP = auto()
+    AMBIGUOUS = auto()
+
+
+class QueryComplexity(Enum):
+    SIMPLE = auto()
+    MODERATE = auto()
+    COMPLEX = auto()
+    EXPERT = auto()
+
+
+@dataclass
+class AnalyzedQuery:
+    original: str
+    intent: QueryIntent
+    complexity: QueryComplexity
+    entities: List[str] = field(default_factory=list)
+    codes: List[str] = field(default_factory=list)
+    locations: List[str] = field(default_factory=list)
+    keywords: List[str] = field(default_factory=list)
+    rewrittenqueries: List[str] = field(default_factory=list)
+    requirescontext: bool = False
+    confidence: float = 0.0
+    suggestedk: int = 10
+    searchstrategy: str = "hybrid"
+
+
+class QueryAnalyzer:
+    CODEPREFIXES = [
+        'ENV', 'CH', 'NPC', 'OBJ', 'ROOM', 'DIA', 'CS', 'EXAM',
+        'TALK', 'BKGNPC', 'COLLECT', 'READ', 'ZOOM', 'HINT',
+        'SKILL', 'ANIM'
+    ]
+
+    INTENTPATTERNS = {
+        QueryIntent.LISTALL: [r'\b(lista|elenco|tutti|tutte|elencami|mostrami tutti|dammi tutti)\b'],
+        QueryIntent.FIXLIST: [r'\b(fix|bug|errori|correzioni|problemi)\b'],
+        QueryIntent.LOCATIONQUERY: [r'\b(in|dentro|nella|nel)\s(room|stanza|location)\b'],
+        QueryIntent.COMPARE: [r'\b(differenz[ae]|confronta|versus|vs)\b'],
+        QueryIntent.EXPLAIN: [r'\b(spiega|spiegami|cos\'è|cosa significa|perch)\b'],
+        QueryIntent.RELATIONSHIP: [r'\b(collegat|relazion|conness)\b'],
+    }
+
+    FOLLOWUPINDICATORS = [r'^(e|ed|anche|inoltre|poi|quindi)\s', r'^(and|also|then)\s', r'^(dimmi di pi|more about|tell me more)']
+
+    def __init__(self, sessioncontext: Optional[dict] = None):
+        self.sessioncontext = sessioncontext or {}
+
+    def analyze(self, query: str) -> AnalyzedQuery:
+        q = (query or "").strip()
+        q_lower = q.lower()
+        q_upper = q.upper()
+
+        codes = self.extract_codes(q_upper)
+        locations = self.extract_locations(q_upper)
+        keywords = self.extract_keywords(q_lower)
+
+        intent = self.detect_intent(q_lower, codes, locations)
+
+        is_followup = self.is_followup(q_lower)
+        if is_followup and not codes and self.sessioncontext.get('lastcode'):
+            codes = [self.sessioncontext['lastcode']]
+            intent = QueryIntent.FOLLOWUP
+
+        complexity = self.assess_complexity(q_lower, intent, codes)
+        rewritten = self.rewrite_queries(q, intent, codes, locations, keywords)
+        suggestedk = self.calculate_optimal_k(intent, complexity)
+        searchstrategy = self.determine_search_strategy(intent, codes)
+        confidence = self.calculate_confidence(intent, codes, keywords)
+
+        return AnalyzedQuery(
+            original=q,
+            intent=intent,
+            complexity=complexity,
+            entities=codes + locations,
+            codes=codes,
+            locations=locations,
+            keywords=keywords,
+            rewrittenqueries=rewritten,
+            requirescontext=is_followup or intent == QueryIntent.FOLLOWUP,
+            confidence=confidence,
+            suggestedk=suggestedk,
+            searchstrategy=searchstrategy,
+        )
+
+    def extract_codes(self, text: str) -> List[str]:
+        codes = []
+        for prefix in self.CODEPREFIXES:
+            # match prefix followed by optional separators and digits
+            for m in re.findall(rf"\b{prefix}[\s\-:]*(\d{{1,6}})\b", text):
+                codes.append(f"{prefix}{m}")
+        return list(dict.fromkeys(codes))
+
+    def extract_locations(self, text: str) -> List[str]:
+        locs = []
+        for m in re.findall(r"\bROOM[\s\-:]*(\d{1,6})\b", text):
+            locs.append(f"ROOM{m}")
+        for m in re.findall(r"\bSTANZA[\s\-:]*(\d{1,6})\b", text):
+            locs.append(f"ROOM{m}")
+        return list(dict.fromkeys(locs))
+
+    def extract_keywords(self, text: str) -> List[str]:
+        stopwords = {
+            'il', 'lo', 'la', 'i', 'gli', 'le', 'un', 'uno', 'una',
+            'di', 'a', 'da', 'in', 'con', 'su', 'per', 'tra', 'fra',
+            'che', 'è', 'sono', 'come', 'cosa', 'dove', 'quando', 'perché',
+            'the', 'a', 'an', 'is', 'are', 'of', 'to', 'in', 'for', 'on',
+            'with', 'at', 'by', 'from', 'what', 'where', 'when', 'why',
+            'mi', 'ti', 'ci', 'vi', 'si', 'me', 'te', 'dimmi', 'dammi'
+        }
+        words = re.findall(r"\b[\wàèéìòù]+\b", text)
+        kws = [w for w in words if w and w not in stopwords and len(w) > 2]
+        return kws[:10]
+
+    def detect_intent(self, query: str, codes: List[str], locations: List[str]) -> QueryIntent:
+        for intent, patterns in self.INTENTPATTERNS.items():
+            for p in patterns:
+                if re.search(p, query, re.IGNORECASE):
+                    return intent
+
+        if codes:
+            return QueryIntent.LOOKUPCODE
+        if locations:
+            return QueryIntent.LOCATIONQUERY
+        return QueryIntent.SEARCHTOPIC
+
+    def is_followup(self, query: str) -> bool:
+        for p in self.FOLLOWUPINDICATORS:
+            if re.match(p, query, re.IGNORECASE):
+                return True
+        if len(query.split()) <= 3 and not self.extract_codes(query.upper()):
+            return True
+        return False
+
+    def assess_complexity(self, query: str, intent: QueryIntent, codes: List[str]) -> QueryComplexity:
+        if intent == QueryIntent.LISTALL:
+            return QueryComplexity.COMPLEX
+        if intent == QueryIntent.COMPARE:
+            return QueryComplexity.COMPLEX
+        if intent == QueryIntent.LOOKUPCODE and len(codes) == 1:
+            return QueryComplexity.SIMPLE
+        if len(query.split()) > 15 or len(codes) > 1:
+            return QueryComplexity.MODERATE
+        return QueryComplexity.SIMPLE
+
+    def rewrite_queries(self, query: str, intent: QueryIntent, codes: List[str], locations: List[str], keywords: List[str]) -> List[str]:
+        rewrites = [query]
+        for code in codes:
+            if len(code) > 3:
+                m = re.match(r'([A-Z]+)(\d+)', code)
+                if m:
+                    prefix, num = m.groups()
+                    rewrites.extend([f"{prefix}{num}", f"ID: {code}"])
+        for loc in locations:
+            m = re.search(r"(\d+)", loc)
+            if m:
+                num = m.group(1)
+                rewrites.extend([f"ROOM{num}", f"Room{num}"])
+        if intent == QueryIntent.LISTALL:
+            for kw in ['env', 'npc', 'ch', 'obj', 'room', 'dialog']:
+                if kw in query.lower():
+                    rewrites.append(f"lista completa {kw}")
+        return list(dict.fromkeys(rewrites))[:5]
+
+    def calculate_optimal_k(self, intent: QueryIntent, complexity: QueryComplexity) -> int:
+        basek = {
+            QueryIntent.LOOKUPCODE: 5,
+            QueryIntent.LISTALL: 30,
+            QueryIntent.SEARCHTOPIC: 10,
+            QueryIntent.COMPARE: 15,
+            QueryIntent.EXPLAIN: 8,
+            QueryIntent.FIXLIST: 25,
+            QueryIntent.LOCATIONQUERY: 12,
+            QueryIntent.RELATIONSHIP: 15,
+            QueryIntent.FOLLOWUP: 5,
+            QueryIntent.AMBIGUOUS: 10,
+        }
+        k = basek.get(intent, 10)
+        if complexity == QueryComplexity.COMPLEX:
+            k = int(k * 1.5)
+        elif complexity == QueryComplexity.EXPERT:
+            k = int(k * 2)
+        return min(k, 50)
+
+    def determine_search_strategy(self, intent: QueryIntent, codes: List[str]) -> str:
+        if codes:
+            return "keywordfirst"
+        if intent in [QueryIntent.LISTALL, QueryIntent.FIXLIST]:
+            return "exhaustive"
+        if intent == QueryIntent.EXPLAIN:
+            return "semanticfirst"
+        return "hybrid"
+
+    def calculate_confidence(self, intent: QueryIntent, codes: List[str], keywords: List[str]) -> float:
+        confidence = 0.5
+        if codes:
+            confidence += 0.3
+        if intent != QueryIntent.AMBIGUOUS:
+            confidence += 0.1
+        if keywords:
+            confidence += min(len(keywords) * 0.02, 0.1)
+        return min(confidence, 1.0)

@@ -1,0 +1,40 @@
+# backend/utils/security.py
+from __future__ import annotations
+
+import os
+import re
+import secrets
+import unicodedata
+from pathlib import Path
+
+from backend.config import config
+
+
+class SecurityManager:
+    UNSAFE_CHARS = re.compile(r'[<>:"/\\|?\x00-\x1f]')
+    PATH_TRAVERSAL = re.compile(r'\.\.')
+
+    @staticmethod
+    def sanitize_filename(filename: str) -> str:
+        filename = unicodedata.normalize("NFKD", filename)
+        filename = SecurityManager.PATH_TRAVERSAL.sub("", filename)
+        filename = SecurityManager.UNSAFE_CHARS.sub("", filename)
+        filename = Path(filename).name
+        name, ext = os.path.splitext(filename)
+        if len(name) > 100:
+            name = name[:100]
+        return f"{name}{ext}" if name else f"file{secrets.token_hex(8)}{ext}"
+
+    @staticmethod
+    def validate_file_extension(filename: str) -> bool:
+        ext = Path(filename).suffix.lower()
+        return ext in config.allowed_extensions
+
+    @staticmethod
+    def validate_file_size(content: bytes) -> bool:
+        return len(content) <= config.max_file_size_mb * 1024 * 1024
+
+    @staticmethod
+    def sanitize_text(text: str, max_length: int = 50000) -> str:
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+        return text[:max_length]

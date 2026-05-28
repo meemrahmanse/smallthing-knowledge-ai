@@ -1,0 +1,225 @@
+from __future__ import annotations
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+from typing import Optional
+
+from backend.config_manager import configmanager
+
+router = APIRouter(prefix="/api/settings", tags=["settings"])
+
+
+class LLMSettingsUpdate(BaseModel):
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    temperature: Optional[float] = Field(None, ge=0, le=2)
+    maxtokens: Optional[int] = Field(None, ge=100, le=32000)
+    topp: Optional[float] = Field(None, ge=0, le=1)
+    groqapikey: Optional[str] = None
+    openaiapikey: Optional[str] = None
+    anthropicapikey: Optional[str] = None
+    ollamaurl: Optional[str] = None
+
+
+class RAGSettingsUpdate(BaseModel):
+    chunksize: Optional[int] = Field(None, ge=100, le=4000)
+    chunkoverlap: Optional[int] = Field(None, ge=0, le=500)
+    topkresults: Optional[int] = Field(None, ge=1, le=100)
+    similaritythreshold: Optional[float] = Field(None, ge=0, le=1)
+    rerankenabled: Optional[bool] = None
+    reranktopk: Optional[int] = Field(None, ge=1, le=50)
+    searchstrategy: Optional[str] = None
+    keywordboost: Optional[float] = Field(None, ge=0, le=1)
+
+
+class UISettingsUpdate(BaseModel):
+    theme: Optional[str] = None
+    language: Optional[str] = None
+    showsources: Optional[bool] = None
+    showconfidence: Optional[bool] = None
+    showtiming: Optional[bool] = None
+    streamingenabled: Optional[bool] = None
+    quicksuggestions: Optional[list[str]] = None
+
+
+class SecuritySettingsUpdate(BaseModel):
+    apikeyrequired: Optional[bool] = None
+    ratelimitrequests: Optional[int] = Field(None, ge=1, le=1000)
+    ratelimitwindow: Optional[int] = Field(None, ge=1, le=3600)
+    maxfilesizemb: Optional[int] = Field(None, ge=1, le=500)
+
+
+class ConfigExport(BaseModel):
+    includeapikeys: bool = False
+
+
+@router.get("/")
+async def get_all_settings():
+    cfg = configmanager.exportconfig()
+    # mask keys and expose presence flags
+    llm = cfg.get('llm', {})
+    for k in ('groqapikey', 'openaiapikey', 'anthropicapikey'):
+        if llm.get(k):
+            llm[k] = '*'  # masked
+    llm['hasgroqapikey'] = bool(configmanager.get('llm.groqapikey'))
+    llm['hasopenaiapikey'] = bool(configmanager.get('llm.openaiapikey'))
+    llm['hasanthropicapikey'] = bool(configmanager.get('llm.anthropicapikey'))
+    cfg['llm'] = llm
+    return cfg
+
+
+@router.get('/llm')
+async def get_llm_settings():
+    return {
+        'provider': configmanager.get('llm.provider'),
+        'model': configmanager.get('llm.model'),
+        'temperature': configmanager.get('llm.temperature'),
+        'maxtokens': configmanager.get('llm.maxtokens'),
+        'topp': configmanager.get('llm.topp'),
+        'ollamaurl': configmanager.get('llm.ollamaurl'),
+        'hasgroqapikey': bool(configmanager.get('llm.groqapikey')),
+        'hasopenaiapikey': bool(configmanager.get('llm.openaiapikey')),
+        'hasanthropicapikey': bool(configmanager.get('llm.anthropicapikey')),
+    }
+
+
+@router.put('/llm')
+async def update_llm_settings(settings: LLMSettingsUpdate):
+    updates = {k: v for k, v in settings.dict().items() if v is not None}
+    if not configmanager.updatesection('llm', updates, modifiedby='api'):
+        raise HTTPException(500, 'Errore aggiornamento impostazioni LLM')
+    return {'status': 'ok', 'updated': list(updates.keys())}
+
+
+@router.get('/rag')
+async def get_rag_settings():
+    return {
+        'chunksize': configmanager.get('rag.chunksize'),
+        'chunkoverlap': configmanager.get('rag.chunkoverlap'),
+        'topkresults': configmanager.get('rag.topkresults'),
+        'similaritythreshold': configmanager.get('rag.similaritythreshold'),
+        'rerankenabled': configmanager.get('rag.rerankenabled'),
+        'reranktopk': configmanager.get('rag.reranktopk'),
+        'searchstrategy': configmanager.get('rag.searchstrategy'),
+        'keywordboost': configmanager.get('rag.keywordboost'),
+    }
+
+
+@router.put('/rag')
+async def update_rag_settings(settings: RAGSettingsUpdate):
+    updates = {k: v for k, v in settings.dict().items() if v is not None}
+    if not configmanager.updatesection('rag', updates, modifiedby='api'):
+        raise HTTPException(500, 'Errore aggiornamento impostazioni RAG')
+    return {'status': 'ok', 'updated': list(updates.keys())}
+
+
+@router.get('/ui')
+async def get_ui_settings():
+    return {
+        'theme': configmanager.get('ui.theme'),
+        'language': configmanager.get('ui.language'),
+        'showsources': configmanager.get('ui.showsources'),
+        'showconfidence': configmanager.get('ui.showconfidence'),
+        'showtiming': configmanager.get('ui.showtiming'),
+        'streamingenabled': configmanager.get('ui.streamingenabled'),
+        'quicksuggestions': configmanager.get('ui.quicksuggestions'),
+    }
+
+
+@router.put('/ui')
+async def update_ui_settings(settings: UISettingsUpdate):
+    updates = {k: v for k, v in settings.dict().items() if v is not None}
+    if not configmanager.updatesection('ui', updates, modifiedby='api'):
+        raise HTTPException(500, 'Errore aggiornamento impostazioni UI')
+    return {'status': 'ok', 'updated': list(updates.keys())}
+
+
+@router.get('/security')
+async def get_security_settings():
+    return {
+        'apikeyrequired': configmanager.get('security.apikeyrequired'),
+        'ratelimitrequests': configmanager.get('security.ratelimitrequests'),
+        'ratelimitwindow': configmanager.get('security.ratelimitwindow'),
+        'maxfilesizemb': configmanager.get('security.maxfilesizemb'),
+        'allowedextensions': configmanager.get('security.allowedextensions'),
+    }
+
+
+@router.put('/security')
+async def update_security_settings(settings: SecuritySettingsUpdate):
+    updates = {k: v for k, v in settings.dict().items() if v is not None}
+    if not configmanager.updatesection('security', updates, modifiedby='api'):
+        raise HTTPException(500, 'Errore aggiornamento impostazioni sicurezza')
+    return {'status': 'ok', 'updated': list(updates.keys())}
+
+
+@router.post('/export')
+async def export_settings(options: ConfigExport):
+    cfg = configmanager.exportconfig()
+    if not options.includeapikeys:
+        cfg.get('llm', {})['groqapikey'] = ''
+        cfg.get('llm', {})['openaiapikey'] = ''
+        cfg.get('llm', {})['anthropicapikey'] = ''
+    return cfg
+
+
+@router.post('/import')
+async def import_settings(config: dict):
+    if not configmanager.importconfig(config, modifiedby='apiimport'):
+        raise HTTPException(400, 'Configurazione non valida')
+    return {'status': 'ok', 'message': 'Configurazione importata'}
+
+
+@router.post('/reset')
+async def reset_settings(section: Optional[str] = None):
+    valid = ['llm', 'rag', 'ui', 'security', None]
+    if section not in valid:
+        raise HTTPException(400, f'Sezione non valida. Usa: {valid}')
+    configmanager.resettodefaults(section)
+    return {'status': 'ok', 'reset': section or 'all'}
+
+
+@router.get('/providers')
+async def get_available_providers():
+    return {
+        'providers': [
+            {
+                'id': 'groq',
+                'name': 'Groq',
+                'models': [
+                    {'id': 'mixtral-8x7b-32768', 'name': 'Mixtral 8x7B', 'context': 32768},
+                ],
+                'requireskey': True,
+                'keyconfigured': bool(configmanager.get('llm.groqapikey'))
+            },
+            {
+                'id': 'openai',
+                'name': 'OpenAI',
+                'models': [
+                    {'id': 'gpt-4o', 'name': 'GPT-4o', 'context': 128000},
+                    {'id': 'gpt-4.1', 'name': 'GPT-4.1', 'context': 32768},
+                    {'id': 'gpt-3.5-turbo', 'name': 'GPT-3.5 Turbo', 'context': 16384},
+                ],
+                'requireskey': True,
+                'keyconfigured': bool(configmanager.get('llm.openaiapikey'))
+            },
+            {
+                'id': 'anthropic',
+                'name': 'Anthropic',
+                'models': [
+                    {'id': 'claude-3.0', 'name': 'Claude 3.0', 'context': 131072},
+                    {'id': 'claude-4.1', 'name': 'Claude 4.1', 'context': 131072},
+                ],
+                'requireskey': True,
+                'keyconfigured': bool(configmanager.get('llm.anthropicapikey'))
+            },
+            {
+                'id': 'ollama',
+                'name': 'Ollama (Local)',
+                'models': [
+                    {'id': 'llama3.1:8b', 'name': 'Llama 3.1 8B', 'context': 131072},
+                ],
+                'requireskey': False,
+                'keyconfigured': True
+            }
+        ]
+    }

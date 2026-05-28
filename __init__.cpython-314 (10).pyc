@@ -1,0 +1,164 @@
+# backend/rag/extractor.py
+from __future__ import annotations
+
+import re
+import threading
+from typing import Optional
+
+from backend.utils.logger import logger
+from backend.utils.normalizer import QueryNormalizer
+
+
+class DirectCodeExtractor:
+    @staticmethod
+    def extract_info_for_code(code: str, chunks: list):
+        code = code.upper()
+        best_chunk = None
+
+        for c in chunks:
+            text = c["text"]
+            if code in text.upper():
+                has_pipe = '|' in text and code in text.upper()
+                best_has_pipe = best_chunk and '|' in best_chunk["text"]
+                if best_chunk is None:
+                    best_chunk = c
+                elif has_pipe and not best_has_pipe:
+                    best_chunk = c
+                elif has_pipe and best_has_pipe and len(text) > len(best_chunk["text"]):
+                    best_chunk = c
+                elif not has_pipe and not best_has_pipe and len(text) > len(best_chunk["text"]):
+                    best_chunk = c
+
+        if not best_chunk:
+            return None
+
+        text = best_chunk["text"]
+        pos = text.upper().find(code)
+        start = max(0, pos - 100)
+        end = min(len(text), pos + 600)
+        snippet = text[start:end]
+
+        return {
+            "code": code,
+            "text": snippet,
+            "source": best_chunk["source"]
+        }
+
+    @staticmethod
+    def _find_code_in_text(code: str, text: str) -> Optional[dict]:
+        match = re.match(r'([A-Z]+)(\d+)', code)
+        if not match:
+            return None
+
+        prefix = match.group(1)
+        number = match.group(2)
+        patterns = [
+            rf'\b{prefix}[\s_\-]*{number}\b',
+            rf'\b{prefix}_{number}\b',
+            rf'\b{prefix}{number}\b',
+        ]
+
+        for pattern in patterns:
+            match = re.search(rf'({pattern}.{{0,150}})', text, re.IGNORECASE)
+            if match:
+                snippet = match.group(1)
+                return DirectCodeExtractor._parse_line(snippet, code)
+
+        return None
+
+    @staticmethod
+    def _parse_line(line: str, code: str) -> dict:
+        line = line.strip()
+        if '|' in line:
+            parts = [p.strip() for p in line.split('|') if p.strip()]
+            if len(parts) >= 2:
+                return {
+                    "code": code,
+                    "id": parts[0],
+                    "name": parts[1] if len(parts) > 1 else "",
+                    "details": ' | '.join(parts[2:]) if len(parts) > 2 else "",
+                    "raw_line": line
+                }
+
+        parts = re.split(r'\s{2,}|\t', line)
+        parts = [p.strip() for p in parts if p.strip()]
+
+        if len(parts) >= 2:
+            return {
+                "code": code,
+                "id": parts[0],
+                "name": parts[1],
+                "details": ' '.join(parts[2:]) if len(parts) > 2 else "",
+                "raw_line": line
+            }
+
+        return {
+            "code": code,
+            "raw_line": line
+        }
+
+
+class SemanticReranker:
+    def __init__(self):
+        self._model = None
+        self.lock = threading.Lock()
+
+    @property
+    def model(self):
+        if self._model is None:
+            with self.lock:
+                if self._model is None:
+                    try:
+                        from sentence_transformers import CrossEncoder
+                        logger.info("Loading cross-encoder reranker...")
+                        self._model = CrossEncoder(
+                            'cross-encoder/ms-marco-MiniLM-L-6-v2',
+                            max_length=512
+                        )
+                        logger.info("Cross-encoder loaded OK")
+                    except Exception as e:
+                        logger.warning(f"Cross-encoder non disponibile: {e}")
+                        self._model = None
+        return self._model
+
+    def rerank(self, query: str, chunks: list[dict], top_k: int = 5) -> list[dict]:
+        if not chunks:
+            return []
+
+        if self.model is not None:
+            try:
+                pairs = [[query, c["text"][:512]] for c in chunks]
+                scores = self.model.predict(pairs)
+                for chunk, score in zip(chunks, scores):
+                    chunk["rerank_score"] = float(score)
+                ranked = sorted(chunks, key=lambda x: x["rerank_score"], reverse=True)
+                return ranked[:top_k]
+            except Exception as e:
+                logger.warning(f"Cross-encoder fallito, uso fallback: {e}")
+
+        query_codes = set(QueryNormalizer.extract_codes(query))
+        query_lower = query.lower()
+        for chunk in chunks:
+            chunk["rerank_score"] = self._score_fallback(query_lower, chunk, query_codes)
+        ranked = sorted(chunks, key=lambda x: x["rerank_score"], reverse=True)
+        return ranked[:top_k]
+
+    def _score_fallback(self, query_lower: str, chunk: dict, query_codes: set) -> float:
+        base = chunk.get("similarity", 0)
+        text = chunk["text"]
+        chunk_codes = set(QueryNormalizer.extract_codes(text))
+        query_codes_norm = {QueryNormalizer.normalize_code(c) for c in query_codes}
+        chunk_codes_norm = {QueryNormalizer.normalize_code(c) for c in chunk_codes}
+
+        exact_matches = query_codes_norm & chunk_codes_norm
+        exact_bonus = len(exact_matches) * 0.5
+
+        if chunk.get("match_type") == "keyword":
+            exact_bonus += 0.4
+
+        words = [w for w in query_lower.split() if len(w) > 3]
+        word_bonus = sum(0.05 for w in words if w in text.lower())
+        length_factor = min(len(text) / 300, 1.0)
+
+        final_score = (base + exact_bonus + word_bonus) * length_factor
+        return min(final_score, 2.0)

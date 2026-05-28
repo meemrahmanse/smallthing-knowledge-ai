@@ -1,0 +1,38 @@
+# backend/utils/cache.py
+from __future__ import annotations
+
+import threading
+import time
+from collections import OrderedDict
+from typing import Any, Optional
+
+
+class LRUCache:
+    def __init__(self, max_size: int = 100, ttl_seconds: int = 300):
+        self.max_size = max_size
+        self.ttl = ttl_seconds
+        self.cache: OrderedDict[str, tuple[Any, float]] = OrderedDict()
+        self.lock = threading.Lock()
+
+    def get(self, key: str) -> Optional[Any]:
+        with self.lock:
+            if key not in self.cache:
+                return None
+            value, timestamp = self.cache[key]
+            if time.time() - timestamp > self.ttl:
+                del self.cache[key]
+                return None
+            self.cache.move_to_end(key)
+            return value
+
+    def set(self, key: str, value: Any):
+        with self.lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+            self.cache[key] = (value, time.time())
+            while len(self.cache) > self.max_size:
+                self.cache.popitem(last=False)
+
+    def clear(self):
+        with self.lock:
+            self.cache.clear()

@@ -1,0 +1,122 @@
+# backend/extractors/pdf_extractor.py
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pdfplumber
+
+from backend.utils.logger import logger
+from backend.utils.normalizer import QueryNormalizer
+
+
+class PDFExtractor:
+    @staticmethod
+    def extract(path: Path) -> str:
+        try:
+            with pdfplumber.open(str(path)) as pdf:
+                pages = []
+                for i, page in enumerate(pdf.pages):
+                    tables = page.extract_tables({
+                        "vertical_strategy": "lines",
+                        "horizontal_strategy": "lines",
+                        "snap_tolerance": 5,
+                        "join_tolerance": 5,
+                        "edge_min_length": 10,
+                        "min_words_vertical": 1,
+                        "min_words_horizontal": 1,
+                    })
+
+                    text = page.extract_text(
+                        x_tolerance=3,
+                        y_tolerance=5,
+                        layout=False
+                    ) or ""
+
+                    table_texts = []
+                    for table in tables:
+                        for row in table:
+                            if not any(c for c in row if c):
+                                continue
+                            cleaned = []
+                            for cell in row:
+                                if cell is None:
+                                    cleaned.append("")
+                                else:
+                                    cell_clean = re.sub(r'\s*\n\s*', ' ', cell)
+                                    cell_clean = re.sub(r'\s+', ' ', cell_clean).strip()
+                                    cleaned.append(cell_clean)
+                            table_texts.append("| " + " | ".join(cleaned) + " |")
+
+                    full_page = text + "\n" + "\n".join(table_texts)
+                    if full_page.strip():
+                        pages.append(f"--- Pagina {i+1} ---\n{full_page}")
+
+                full_text = "\n\n".join(pages)
+                full_text = PDFExtractor._clean_text(full_text)
+
+                lines = full_text.split('\n')
+                current_location = ""
+                result_lines = []
+                for line in lines:
+                    loc_match = re.search(r'LOCATION:\s*(ROOM_\d+\w*)', line.upper())
+                    if loc_match:
+                        current_location = loc_match.group(1)
+                    if current_location and '|' in line:
+                        line_up = line.upper()
+                        if any(p in line_up for p in ['ENV', 'NPC', 'BKGNPC']):
+                            if current_location not in line.upper():
+                                line = line.rstrip(' |') + f' | {current_location} |'
+                    result_lines.append(line)
+                full_text = '\n'.join(result_lines)
+
+                return QueryNormalizer.normalize_text_for_search(full_text)
+        except Exception as e:
+            logger.error(f"PDF extraction failed for {path.name}: {e}")
+            return ""
+
+    @staticmethod
+    def _clean_text(text: str) -> str:
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = re.sub(r'([A-Z]{2,})\n\s*(\d+)', r'\1\2', text)
+        text = re.sub(r'[^\S\n]+', ' ', text)
+        lines = [line.strip() for line in text.split('\n')]
+        return '\n'.join(lines)
+
+    @staticmethod
+    def _is_table_header(line: str) -> bool:
+        line_upper = line.upper()
+        return ('ID' in line_upper and 'NOME' in line_upper) or \
+               ('|' in line and 'ID' in line_upper)
+
+    @staticmethod
+    def _looks_like_table_row(line: str) -> bool:
+        prefixes = ['ENV', 'NPC', 'CH', 'OBJ', 'BKGNPC', 'ROOM']
+        line_upper = line.upper().strip()
+        for prefix in prefixes:
+            if re.match(rf'^{prefix}[\s_\-]*\d+', line_upper):
+                return True
+        return '|' in line
+
+    @staticmethod
+    def _format_table(lines: list[str]) -> str:
+        formatted = []
+        for line in lines:
+            if '|' not in line:
+                match = re.match(
+                    r'^((?:ENV|NPC|CH|OBJ|BKGNPC|ROOM)[\s_\-]*\d+)\s+(.+)',
+                    line,
+                    re.IGNORECASE
+                )
+                if match:
+                    code = match.group(1)
+                    rest = match.group(2)
+                    parts = re.split(r'\s{2,}', rest, maxsplit=1)
+                    if len(parts) >= 2:
+                        line = f"| {code} | {parts[0]} | {parts[1]} |"
+                    else:
+                        line = f"| {code} | {rest} |"
+
+            formatted.append(line)
+
+        return '\n'.join(formatted)

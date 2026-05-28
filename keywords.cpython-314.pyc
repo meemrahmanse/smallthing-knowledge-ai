@@ -1,0 +1,80 @@
+# -*- coding: utf-8 -*-
+"""Embedding management module."""
+
+import hashlib
+import threading
+from typing import Optional
+
+import numpy as np
+import torch
+from sentence_transformers import SentenceTransformer
+
+from backend.config import config
+from backend.logger import logger
+from backend.utils import LRUCache
+
+
+class EmbeddingManager:
+    """Manage text embeddings with caching."""
+
+    def __init__(self):
+        self._model: Optional[SentenceTransformer] = None
+        self.lock = threading.Lock()
+        self.cache = LRUCache(max_size=500, ttl_seconds=600)
+
+    @property
+    def model(self) -> SentenceTransformer:
+        """Lazy load embedding model."""
+        if self._model is None:
+            with self.lock:
+                if self._model is None:
+                    logger.info("Loading embedding model...")
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                    self._model = SentenceTransformer(config.embedding_model, device=device)
+                    logger.info(f"Embedding model loaded on {device}")
+        return self._model
+
+    def encode(self, texts: list[str], use_cache: bool = True) -> np.ndarray:
+        """Encode texts to embeddings."""
+        if not texts:
+            return np.array([])
+
+        results = []
+        uncached_texts = []
+        uncached_indices = []
+
+        if use_cache:
+            for i, text in enumerate(texts):
+                cache_key = hashlib.md5(text.encode()).hexdigest()
+                cached = self.cache.get(cache_key)
+                if cached is not None:
+                    results.append((i, cached))
+                else:
+                    uncached_texts.append(text)
+                    uncached_indices.append(i)
+        else:
+            uncached_texts = texts
+            uncached_indices = list(range(len(texts)))
+
+        if uncached_texts:
+            embeddings = self.model.encode(
+                uncached_texts,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+                normalize_embeddings=True
+            )
+            for idx, text, emb in zip(uncached_indices, uncached_texts, embeddings):
+                if use_cache:
+                    cache_key = hashlib.md5(text.encode()).hexdigest()
+                    self.cache.set(cache_key, emb)
+                results.append((idx, emb))
+
+        results.sort(key=lambda x: x[0])
+        return np.array([emb for _, emb in results])
+
+    def encode_single(self, text: str) -> np.ndarray:
+        """Encode single text."""
+        return self.encode([text])[0]
+
+
+embedding_manager = EmbeddingManager()

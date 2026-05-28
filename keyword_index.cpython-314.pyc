@@ -1,0 +1,251 @@
+# backend/rag/engine.py
+from __future__ import annotations
+
+import hashlib
+import secrets
+import threading
+from datetime import datetime
+from pathlib import Path
+
+import chromadb
+from chromadb.config import Settings as ChromaSettings
+from docx import Document as DocxDoc
+
+from backend.config import config
+from backend.extractors.pdf_extractor import PDFExtractor
+from backend.extractors.chunker import TableAwareChunker
+from backend.rag.keyword_index import KeywordIndex
+from backend.rag.extractor import SemanticReranker
+from backend.utils.cache import LRUCache
+from backend.utils.embeddings import embedding_manager
+from backend.utils.logger import logger
+from backend.utils.normalizer import QueryNormalizer
+
+
+chunker = TableAwareChunker(config.chunk_size, config.chunk_overlap)
+keyword_index = KeywordIndex()
+reranker = SemanticReranker()
+
+
+class RAGEngine:
+    def __init__(self):
+        self.collection = None
+        self.lock = threading.RLock()
+        self.query_cache = LRUCache(max_size=200, ttl_seconds=300)
+        self.document_hashes: dict[str, str] = {}
+
+    def init(self):
+        config.chroma_dir.mkdir(exist_ok=True)
+        client = chromadb.PersistentClient(
+            path=str(config.chroma_dir),
+            settings=ChromaSettings(anonymized_telemetry=False)
+        )
+
+        self.collection = client.get_or_create_collection(
+            name=config.chroma_collection,
+            metadata={"hnsw:space": "cosine"}
+        )
+        logger.info(f"ChromaDB initialized — {self.collection.count()} chunks indexed")
+
+        config.docs_dir.mkdir(exist_ok=True)
+        self._rebuild_keyword_index()
+
+        for f in config.docs_dir.iterdir():
+            if f.suffix.lower() in config.allowed_extensions:
+                self.index_file(f, force=False)
+
+    def _rebuild_keyword_index(self):
+        if not self.collection or self.collection.count() == 0:
+            return
+
+        try:
+            all_data = self.collection.get(include=["documents", "metadatas"])
+            for chunk_id, text, meta in zip(
+                all_data["ids"],
+                all_data["documents"],
+                all_data["metadatas"]
+            ):
+                source = meta.get("source", "unknown")
+                keyword_index.add_chunk(chunk_id, text, source)
+
+            logger.info(f"Keyword index rebuilt: {keyword_index.get_stats()}")
+        except Exception as e:
+            logger.error(f"Failed to rebuild keyword index: {e}")
+
+    def _compute_file_hash(self, path: Path) -> str:
+        hasher = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    def _extract_text(self, path: Path) -> str:
+        ext = path.suffix.lower()
+        try:
+            if ext == ".pdf":
+                text = PDFExtractor.extract(path)
+                return QueryNormalizer.normalize_text_for_search(text)
+            elif ext == ".docx":
+                d = DocxDoc(str(path))
+                return "\n\n".join(p.text for p in d.paragraphs if p.text.strip())
+            else:
+                return path.read_text(encoding="utf-8", errors="ignore")
+        except Exception as e:
+            logger.error(f"Text extraction failed for {path.name}: {e}")
+            return ""
+
+    def index_file(self, path: Path, force: bool = False) -> int:
+        with self.lock:
+            file_hash = self._compute_file_hash(path)
+            existing = self.collection.get(
+                where={"source": path.name},
+                include=["metadatas"]
+            )
+
+            if existing["ids"]:
+                existing_hash = existing["metadatas"][0].get("file_hash", "")
+                if existing_hash == file_hash and not force:
+                    logger.debug(f"Already indexed (unchanged): {path.name}")
+                    return 0
+
+                logger.info(f"Updating index for: {path.name}")
+                for chunk_id in existing["ids"]:
+                    keyword_index.remove_chunk(chunk_id)
+                self.collection.delete(ids=existing["ids"])
+
+            text = self._extract_text(path)
+            if not text.strip():
+                logger.warning(f"No text extracted from: {path.name}")
+                return 0
+
+            chunks = chunker.chunk(text)
+            if not chunks:
+                return 0
+
+            embeddings = embedding_manager.encode(chunks, use_cache=False)
+            ids = [f"{path.stem}_{i}_{secrets.token_hex(4)}" for i in range(len(chunks))]
+            metadatas = [
+                {
+                    "source": path.name,
+                    "chunk_index": i,
+                    "file_hash": file_hash,
+                    "indexed_at": datetime.now().isoformat()
+                }
+                for i in range(len(chunks))
+            ]
+
+            self.collection.add(
+                documents=chunks,
+                embeddings=embeddings.tolist(),
+                ids=ids,
+                metadatas=metadatas
+            )
+
+            for chunk_id, chunk_text in zip(ids, chunks):
+                keyword_index.add_chunk(chunk_id, chunk_text, path.name)
+
+            self.document_hashes[path.name] = file_hash
+            logger.info(f"Indexed: {path.name} ({len(chunks)} chunks)")
+            self.query_cache.clear()
+            return len(chunks)
+
+    def remove_document(self, filename: str) -> bool:
+        with self.lock:
+            existing = self.collection.get(where={"source": filename})
+            if existing["ids"]:
+                for chunk_id in existing["ids"]:
+                    keyword_index.remove_chunk(chunk_id)
+                self.collection.delete(ids=existing["ids"])
+                self.document_hashes.pop(filename, None)
+                self.query_cache.clear()
+                logger.info(f"Removed from index: {filename}")
+                return True
+            return False
+
+    def retrieve(self, query: str, k: int = None) -> list[dict]:
+        if not self.collection or self.collection.count() == 0:
+            return []
+
+        k = k or config.top_k_results
+        if QueryNormalizer.is_code_query(query):
+            k = k * 2
+
+        cache_key = f"{query}_{k}"
+        cached = self.query_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            output = []
+            seen_hashes = set()
+            keyword_results = keyword_index.search(query)
+
+            if keyword_results:
+                logger.debug(f"Keyword search found {len(keyword_results)} chunks")
+                for chunk_id, score in keyword_results[:k]:
+                    chunk_text = keyword_index.get_chunk(chunk_id)
+                    if chunk_text:
+                        text_hash = hashlib.md5(chunk_text[:200].encode()).hexdigest()
+                        if text_hash not in seen_hashes:
+                            seen_hashes.add(text_hash)
+                            output.append({
+                                "text": chunk_text,
+                                "source": keyword_index.get_source(chunk_id),
+                                "similarity": 0.8 + (score * 0.2),
+                                "match_type": "keyword"
+                            })
+
+            with self.lock:
+                query_embedding = embedding_manager.encode_single(query)
+                results = self.collection.query(
+                    query_embeddings=[query_embedding.tolist()],
+                    n_results=min(k * 2, self.collection.count()),
+                    include=["documents", "metadatas", "distances"]
+                )
+
+            for doc, meta, distance in zip(
+                results["documents"][0],
+                results["metadatas"][0],
+                results["distances"][0]
+            ):
+                similarity = 1 - distance
+                if similarity >= config.similarity_threshold:
+                    text_hash = hashlib.md5(doc[:200].encode()).hexdigest()
+                    if text_hash not in seen_hashes:
+                        seen_hashes.add(text_hash)
+                        output.append({
+                            "text": doc,
+                            "source": meta.get("source", "unknown"),
+                            "similarity": round(similarity, 4),
+                            "match_type": "semantic"
+                        })
+
+            keyword_exact = [c for c in output if c.get("match_type") == "keyword"]
+            others = [c for c in output if c.get("match_type") != "keyword"]
+            reranked_others = reranker.rerank(query, others, config.rerank_top_k)
+            output = keyword_exact + reranked_others
+
+            self.query_cache.set(cache_key, output)
+            return output
+        except Exception as e:
+            logger.error(f"Retrieval error: {e}")
+            return []
+
+    def get_count(self) -> int:
+        return self.collection.count() if self.collection else 0
+
+    def get_documents(self) -> list[dict]:
+        docs = []
+        for f in config.docs_dir.iterdir():
+            if f.suffix.lower() in config.allowed_extensions:
+                is_indexed = f.name in self.document_hashes
+                docs.append({
+                    "name": f.name,
+                    "size_kb": round(f.stat().st_size / 1024, 2),
+                    "extension": f.suffix.lower(),
+                    "indexed": is_indexed
+                })
+        return docs
+
+
+rag = RAGEngine()

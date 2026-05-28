@@ -1,0 +1,177 @@
+# -*- coding: utf-8 -*-
+"""Utility classes and functions."""
+
+import os
+import re
+import secrets
+import threading
+import time
+import unicodedata
+from collections import OrderedDict
+from pathlib import Path
+from typing import Any, Optional
+
+from backend.config import config
+
+
+class QueryNormalizer:
+    """Normalizes queries to match code patterns."""
+
+    CODE_PREFIXES = [
+        'ENV', 'CH', 'NPC', 'OBJ', 'ROOM', 'DIA', 'CS', 'EXAM',
+        'TALK', 'BKGNPC', 'COLLECT', 'READ', 'ZOOM', 'HINT',
+        'SKILL', 'ANIM'
+    ]
+
+    @classmethod
+    def normalize_code(cls, code: str) -> str:
+        """Normalize a code by removing separators."""
+        code = code.upper().strip()
+        code = re.sub(r'[\s_\-]+', '', code)
+        match = re.match(r'([A-Z]+)(\d+)', code)
+        if match:
+            return match.group(1) + str(int(match.group(2)))
+        return code
+
+    @classmethod
+    def extract_codes(cls, text: str) -> list[str]:
+        """Extract all codes from text."""
+        text_upper = text.upper()
+        codes = set()
+
+        for prefix in cls.CODE_PREFIXES:
+            pattern = rf'\b{prefix}[\s_\-]*(\d+)'
+            matches = re.findall(pattern, text_upper)
+            for num in matches:
+                codes.add(f"{prefix}{num}")
+
+        return list(codes)
+
+    @classmethod
+    def is_code_query(cls, query: str) -> bool:
+        """Check if query searches for a specific code."""
+        codes = cls.extract_codes(query)
+        return len(codes) > 0
+
+    @classmethod
+    def normalize_text_for_search(cls, text: str) -> str:
+        """Normalize text for search."""
+        result = text.upper()
+        for prefix in cls.CODE_PREFIXES:
+            result = re.sub(
+                rf'\b({prefix})[\s_\-]+(\d+)',
+                r'\1\2',
+                result
+            )
+        return result
+
+
+class SecurityManager:
+    """Security utilities for input validation."""
+
+    UNSAFE_CHARS = re.compile(r'[<>:"/\\|?\x00-\x1f]')
+    PATH_TRAVERSAL = re.compile(r'\.\.')
+
+    @staticmethod
+    def sanitize_filename(filename: str) -> str:
+        """Sanitize filename for safe storage."""
+        filename = unicodedata.normalize("NFKD", filename)
+        filename = SecurityManager.PATH_TRAVERSAL.sub("", filename)
+        filename = SecurityManager.UNSAFE_CHARS.sub("", filename)
+        filename = Path(filename).name
+        name, ext = os.path.splitext(filename)
+        if len(name) > 100:
+            name = name[:100]
+        return f"{name}{ext}" if name else f"file{secrets.token_hex(8)}{ext}"
+
+    @staticmethod
+    def validate_file_extension(filename: str) -> bool:
+        """Validate file extension."""
+        ext = Path(filename).suffix.lower()
+        return ext in config.allowed_extensions
+
+    @staticmethod
+    def validate_file_size(content: bytes) -> bool:
+        """Validate file size."""
+        return len(content) <= config.max_file_size_mb * 1024 * 1024
+
+    @staticmethod
+    def sanitize_text(text: str, max_length: int = 50000) -> str:
+        """Remove control characters from text."""
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+        return text[:max_length]
+
+
+class RateLimiter:
+    """Thread-safe rate limiter."""
+
+    def __init__(self, max_requests: int, window_seconds: int):
+        self.max_requests = max_requests
+        self.window = window_seconds
+        self.requests: dict[str, list[float]] = {}
+        self.lock = threading.Lock()
+
+    def is_allowed(self, client_id: str) -> bool:
+        """Check if request is allowed."""
+        now = time.time()
+        cutoff = now - self.window
+        with self.lock:
+            if client_id not in self.requests:
+                self.requests[client_id] = []
+            self.requests[client_id] = [t for t in self.requests[client_id] if t > cutoff]
+            if len(self.requests[client_id]) >= self.max_requests:
+                return False
+            self.requests[client_id].append(now)
+            return True
+
+    def cleanup(self):
+        """Remove expired entries."""
+        now = time.time()
+        cutoff = now - self.window
+        with self.lock:
+            to_remove = []
+            for client_id, times in self.requests.items():
+                self.requests[client_id] = [t for t in times if t > cutoff]
+                if not self.requests[client_id]:
+                    to_remove.append(client_id)
+            for client_id in to_remove:
+                del self.requests[client_id]
+
+
+class LRUCache:
+    """Thread-safe LRU cache with TTL."""
+
+    def __init__(self, max_size: int = 100, ttl_seconds: int = 300):
+        self.max_size = max_size
+        self.ttl = ttl_seconds
+        self.cache: OrderedDict[str, tuple[Any, float]] = OrderedDict()
+        self.lock = threading.Lock()
+
+    def get(self, key: str) -> Optional[Any]:
+        """Get value from cache."""
+        with self.lock:
+            if key not in self.cache:
+                return None
+            value, timestamp = self.cache[key]
+            if time.time() - timestamp > self.ttl:
+                del self.cache[key]
+                return None
+            self.cache.move_to_end(key)
+            return value
+
+    def set(self, key: str, value: Any):
+        """Set value in cache."""
+        with self.lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+            self.cache[key] = (value, time.time())
+            while len(self.cache) > self.max_size:
+                self.cache.popitem(last=False)
+
+    def clear(self):
+        """Clear all cache."""
+        with self.lock:
+            self.cache.clear()
+
+
+rate_limiter = RateLimiter(config.rate_limit_requests, config.rate_limit_window)

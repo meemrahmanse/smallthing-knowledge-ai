@@ -1,0 +1,37 @@
+# backend/utils/rate_limiter.py
+from __future__ import annotations
+
+import threading
+import time
+
+
+class RateLimiter:
+    def __init__(self, max_requests: int, window_seconds: int):
+        self.max_requests = max_requests
+        self.window = window_seconds
+        self.requests: dict[str, list[float]] = {}
+        self.lock = threading.Lock()
+
+    def is_allowed(self, client_id: str) -> bool:
+        now = time.time()
+        cutoff = now - self.window
+        with self.lock:
+            if client_id not in self.requests:
+                self.requests[client_id] = []
+            self.requests[client_id] = [t for t in self.requests[client_id] if t > cutoff]
+            if len(self.requests[client_id]) >= self.max_requests:
+                return False
+            self.requests[client_id].append(now)
+            return True
+
+    def cleanup(self):
+        now = time.time()
+        cutoff = now - self.window
+        with self.lock:
+            to_remove = []
+            for client_id, times in self.requests.items():
+                self.requests[client_id] = [t for t in times if t > cutoff]
+                if not self.requests[client_id]:
+                    to_remove.append(client_id)
+            for client_id in to_remove:
+                del self.requests[client_id]
